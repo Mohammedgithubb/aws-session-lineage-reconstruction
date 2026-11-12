@@ -1,0 +1,37 @@
+# --- Secrets: never push these ---
+detection/data/demo_credentials.ini
+detection/config.json
+config.json
+*.ini
+.env
+.aws/
+
+# --- Generated data from live runs (keep only the synthetic replay files) ---
+detection/data/*
+!detection/data/replay_synthetic.jsonl
+!detection/data/replay_truth.jsonl
+*.db
+*.sqlite
+*.pkl
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Node / dashboard ---
+node_modules/
+dashboard/dist/
+
+# --- Java (reconstruction) ---
+target/
+build/
+out/
+*.class
+.idea/
+*.iml
+
+# --- OS ---
+.DS_Store
+Thumbs.db
