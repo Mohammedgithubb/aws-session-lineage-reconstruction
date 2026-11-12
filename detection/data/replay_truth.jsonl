@@ -1,0 +1,3 @@
+{"key": "ASIA80PRBHXC9ZMNRJYO", "role": "pw25-Role-A", "first_call": "2026-11-05T04:10:00Z", "note": "stolen Role-A session key (also used by the victim)"}
+{"key": "ASIAILG6S9GG2IFM0Z2W", "role": "pw25-Role-B", "first_call": "2026-11-05T04:12:48Z", "note": "attacker Role-B session; its AssumeRole record was hidden"}
+{"key": "ASIA260LEAY5K5XNXOXB", "role": "pw25-Role-C", "first_call": "2026-11-05T04:14:08Z", "note": "attacker Role-C session"}

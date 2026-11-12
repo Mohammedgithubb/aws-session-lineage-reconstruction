@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PW_25_NS_02 detection sandbox. CloudTrail trail with digest files, live
+  EventBridge -> SQS stream, write-once evidence bucket, demo role chain
+  Role-A -> Role-B -> Role-C, decoys, and a budget alarm. Deploy in us-east-1.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email for the budget alarm
+  MonthlyBudgetUSD:
+    Type: Number
+    Default: 5
+
+Resources:
+  # ---------- CloudTrail log bucket ----------
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "pw25-trail-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/pw25-trail"
+          - Sid: Write
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/pw25-trail"
+
+  # ---------- Test bucket (normal files + decoys) ----------
+  TestBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "pw25-test-data-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------- Trail ----------
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: pw25-trail
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "${TestBucket.Arn}/"
+
+  # ---------- Evidence bucket (write-once) ----------
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "pw25-evidence-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------- Live stream: EventBridge -> SQS ----------
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: pw25-cloudtrail-events
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  EventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt CloudTrailRule.Arn
+
+  CloudTrailRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: pw25-all-api-calls
+      Description: Every CloudTrail API call (read and write) to SQS
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+      Targets:
+        - Id: queue
+          Arn: !GetAtt EventQueue.Arn
+
+  # ---------- Demo identities ----------
+  DevUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: pw25-dev-alice
+      Policies:
+        - PolicyName: assume-role-a
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/pw25-Role-A"
+
+  DevUserKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref DevUser
+
+  RoleA:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pw25-Role-A
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !GetAtt DevUser.Arn }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: role-a
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListAllMyBuckets, s3:GetBucketLocation]
+                Resource: "*"
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !GetAtt TestBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "${TestBucket.Arn}/reports/*"
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/pw25-Role-B"
+
+  RoleB:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pw25-Role-B
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !GetAtt RoleA.Arn }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: role-b
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [iam:ListRoles, iam:GetRole]
+                Resource: "*"
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/pw25-Role-C"
+
+  RoleC:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pw25-Role-C
+      Tags:
+        - { Key: sensitivity, Value: privileged }
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !GetAtt RoleB.Arn }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: role-c
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !GetAtt TestBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "${TestBucket.Arn}/*"
+
+  # ---------- Decoy identity: NO permissions ----------
+  DecoyUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: pw25-backup-svc
+      Tags:
+        - { Key: purpose, Value: honeytoken-no-permissions }
+
+  DecoyKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref DecoyUser
+
+  # ---------- Budget alarm ----------
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: pw25-sandbox
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUSD, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+
+Outputs:
+  QueueUrl: { Value: !Ref EventQueue }
+  TrailBucket: { Value: !Ref TrailBucket }
+  TestBucket: { Value: !Ref TestBucket }
+  EvidenceBucket: { Value: !Ref EvidenceBucket }
+  RoleA: { Value: !GetAtt RoleA.Arn }
+  RoleB: { Value: !GetAtt RoleB.Arn }
+  RoleC: { Value: !GetAtt RoleC.Arn }
+  DevUserKeyId: { Value: !Ref DevUserKey }
+  DevUserSecret:
+    Description: Sandbox demo user only. Do not reuse.
+    Value: !GetAtt DevUserKey.SecretAccessKey
+  DecoyKeyId: { Value: !Ref DecoyKey }
+  DecoySecret:
+    Description: Decoy key with no permissions.
+    Value: !GetAtt DecoyKey.SecretAccessKey
